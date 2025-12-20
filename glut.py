@@ -4,6 +4,7 @@ from PIL import Image
 import math
 from mmgp import offload
 import torch
+import torch.nn as nn
 import numpy as np
 import gradio as gr
 import socket
@@ -11,8 +12,8 @@ import psutil
 import random
 import argparse
 import datetime
-from diffusers import QwenImageLayeredPipeline, QwenImageTransformer2DModel
-from diffusers.utils import load_image
+from diffusers import QwenImageLayeredPipeline, QwenImageTransformer2DModel, FlowMatchEulerDiscreteScheduler
+import safetensors.torch
 from transformers import Qwen2_5_VLForConditionalGeneration
 
 
@@ -60,8 +61,74 @@ if os.path.exists(lora_dir):
 else:
     lora_choices = []
 
+
+def build_lora_names(key, lora_down_key, lora_up_key, is_native_weight):
+    base = "diffusion_model." if is_native_weight else ""
+    lora_down = base + key.replace(".weight", lora_down_key)
+    lora_up = base + key.replace(".weight", lora_up_key)
+    lora_alpha = base + key.replace(".weight", ".alpha")
+    return lora_down, lora_up, lora_alpha
+
+
+def load_and_merge_lora_weight(
+    model: nn.Module,
+    lora_state_dict: dict,
+    lora_down_key: str = ".lora_down.weight",
+    lora_up_key: str = ".lora_up.weight",
+):
+    is_native_weight = any("diffusion_model." in key for key in lora_state_dict)
+    for key, value in model.named_parameters():
+        lora_down_name, lora_up_name, lora_alpha_name = build_lora_names(
+            key, lora_down_key, lora_up_key, is_native_weight
+        )
+        if lora_down_name in lora_state_dict:
+            lora_down = lora_state_dict[lora_down_name]
+            lora_up = lora_state_dict[lora_up_name]
+            lora_alpha = float(lora_state_dict[lora_alpha_name])
+            rank = lora_down.shape[0]
+            scaling_factor = lora_alpha / rank
+            assert lora_up.dtype == torch.float32
+            assert lora_down.dtype == torch.float32
+            delta_W = scaling_factor * torch.matmul(lora_up, lora_down)
+            value.data = (value.data + delta_W).type_as(value.data)
+    return model
+
+
+def load_and_merge_lora_weight_from_safetensors(
+    model: nn.Module,
+    lora_weight_path: str,
+    lora_down_key: str = ".lora_down.weight",
+    lora_up_key: str = ".lora_up.weight",
+):
+    lora_state_dict = {}
+    with safetensors.torch.safe_open(lora_weight_path, framework="pt", device="cpu") as f:
+        for key in f.keys():
+            lora_state_dict[key] = f.get_tensor(key)
+    model = load_and_merge_lora_weight(
+        model, lora_state_dict, lora_down_key, lora_up_key
+    )
+    return model
+
+
 def load_model(mode):
     global pipe, mmgp
+    scheduler_config = {
+        "base_image_seq_len": 256,
+        "base_shift": math.log(3),  # We use shift=3 in distillation
+        "invert_sigmas": False,
+        "max_image_seq_len": 8192,
+        "max_shift": math.log(3),  # We use shift=3 in distillation
+        "num_train_timesteps": 1000,
+        "shift": 1.0,
+        "shift_terminal": None,  # set shift_terminal to None
+        "stochastic_sampling": False,
+        "time_shift_type": "exponential",
+        "use_beta_sigmas": False,
+        "use_dynamic_shifting": True,
+        "use_exponential_sigmas": False,
+        "use_karras_sigmas": False,
+    }
+    scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
     text_encoder = offload.fast_load_transformers_model(
         f"{repo_id}/text_encoder/mmgp.safetensors",
         do_quantize=False,
@@ -77,12 +144,14 @@ def load_model(mode):
             modelClass=QwenImageTransformer2DModel,
             forcedConfigPath=f"{repo_id}/transformer/config.json",
         )
+        #transformer = QwenImageTransformer2DModel.from_pretrained(repo_id, subfolder="transformer", torch_dtype=dtype)
+        #transformer = load_and_merge_lora_weight_from_safetensors(transformer, "Qwen-Image-Edit-2509-Lightning-4steps-V1.0-fp32.safetensors")
         pipe = QwenImageLayeredPipeline.from_pretrained(
             repo_id, 
+            #scheduler=scheduler,
             text_encoder=text_encoder,
             transformer=transformer,
             torch_dtype=dtype,
-            #low_cpu_mem_usage=False, 
         )
         pipe.set_progress_bar_config(disable=None)
     mmgp = offload.all(
@@ -169,10 +238,10 @@ def generate_i2i(
             negative_prompt_embeds_mask=negative_prompt_embeds_mask,
         )
         output_image = output.images[0]
-        for i, image in enumerate(output_image):
-            image.save(f"outputs/{timestamp}{i:02d}.png")
+        for j, image in enumerate(output_image):
+            image.save(f"outputs/{timestamp}{i:02d}{j:02d}.png")
             results.append(image)
-        yield results, f"种子数{seed+i}，保存地址f'outputs/{timestamp}{i:02d}.png'"
+        yield results, f"种子数{seed+i}，保存地址f'outputs/{timestamp}{i:02d}{j:02d}.png'"
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
